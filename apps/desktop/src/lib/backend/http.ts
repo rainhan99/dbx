@@ -351,7 +351,7 @@ export async function listInstalledAgentsLocal(): Promise<AgentDriverInfo[]> {
   return get("/api/agents/installed-local");
 }
 
-export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
+export async function listInstalledAgents(_source?: UpdateDownloadSource): Promise<AgentDriverInfo[]> {
   return get("/api/agents/installed");
 }
 
@@ -379,11 +379,11 @@ export async function restartDriverRuntime(runtimeId: string): Promise<void> {
   await post("/api/agents/runtime/restart", { runtimeId });
 }
 
-export async function installAgent(dbType: string): Promise<void> {
+export async function installAgent(dbType: string, _source?: UpdateDownloadSource): Promise<void> {
   await post("/api/agents/install", { dbType });
 }
 
-export async function upgradeAllAgents(): Promise<UpgradeAllAgentDriversResult> {
+export async function upgradeAllAgents(_source?: UpdateDownloadSource): Promise<UpgradeAllAgentDriversResult> {
   return post("/api/agents/upgrade-all", {});
 }
 
@@ -436,7 +436,7 @@ export async function importAgentJar(dbType: string, pathOrFile: string | File):
   if (!uploadRes.ok) throw new Error(await uploadRes.text());
 }
 
-export async function reinstallJre(jreKey?: string): Promise<void> {
+export async function reinstallJre(jreKey?: string, _source?: UpdateDownloadSource): Promise<void> {
   await post("/api/agents/reinstall-jre", { jreKey });
 }
 
@@ -1691,11 +1691,12 @@ function downloadTextFile(filePath: string, fallbackFileName: string, content: s
   URL.revokeObjectURL(url);
 }
 
-export async function exportQueryResultXlsx(filePath: string, sheetName: string | undefined, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
+export async function exportQueryResultXlsx(filePath: string, sheetName: string | undefined, columns: string[], columnTypes: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
   const { buildXlsxWorkbook } = await import("@/lib/export/xlsxExport");
   const workbook = buildXlsxWorkbook({
     sheetName: sheetName || "Export",
     columns,
+    columnTypes,
     rows,
   });
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
@@ -1710,7 +1711,7 @@ export async function exportQueryResultXlsx(filePath: string, sheetName: string 
   URL.revokeObjectURL(url);
 }
 
-export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
+export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; columnTypes?: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
   const { buildXlsxWorkbookMulti } = await import("@/lib/export/xlsxExport");
   const workbook = buildXlsxWorkbookMulti(worksheets);
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";

@@ -18,6 +18,7 @@ const DatabaseSearchDialog = defineAsyncComponent(() => import("@/components/sea
 const DatabaseExportDialog = defineAsyncComponent(() => import("@/components/export/DatabaseExportDialog.vue"));
 const DataGenerateDialog = defineAsyncComponent(() => import("@/components/generate/DataGenerateDialog.vue"));
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { useDialogSources } from "@/composables/useDialogSources";
 import type { ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import type { SqlParameterDescriptor, SqlParameterSyntax } from "@/lib/sql/sqlParameters";
@@ -83,7 +84,17 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
+const productionSafetyStore = useProductionSafetyStore();
 const dialogs = useDialogSources();
+const productionConfirmationDetails = computed(() => {
+  const request = productionSafetyStore.pending;
+  if (!request) return "";
+  return t("production.confirmDetails", {
+    connection: request.connectionName || "-",
+    database: request.productionDatabases?.join(", ") || request.database || "-",
+    source: request.source || "-",
+  });
+});
 
 const editConfig = computed(() => {
   const id = connectionStore.editingConnectionId;
@@ -137,6 +148,18 @@ watch(
     @update:open="emit('update:showDangerDialog', $event)"
     @update:suppress-future-prompts="emit('update:suppressDangerConfirm', $event)"
     @confirm="emit('dangerConfirm')"
+  />
+  <DangerConfirmDialog
+    v-if="productionSafetyStore.pending"
+    :open="true"
+    :title="t('production.confirmTitle')"
+    :message="t('production.confirmMessage')"
+    :details-text="productionConfirmationDetails"
+    :sql="productionSafetyStore.pending.sql"
+    :confirm-label="t('production.confirmAction')"
+    :close-on-confirm="false"
+    @update:open="(open) => !open && productionSafetyStore.cancel()"
+    @confirm="productionSafetyStore.confirm()"
   />
   <SqlParameterDialog
     v-if="showSqlParameterDialog"

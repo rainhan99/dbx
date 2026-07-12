@@ -1197,8 +1197,8 @@ export async function listInstalledAgentsLocal(): Promise<AgentDriverInfo[]> {
   return invoke("list_installed_agents_local");
 }
 
-export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
-  return invoke("list_installed_agents");
+export async function listInstalledAgents(source?: UpdateDownloadSource): Promise<AgentDriverInfo[]> {
+  return invoke("list_installed_agents", { source });
 }
 
 export async function isAgentInstalled(dbType: string): Promise<boolean> {
@@ -1225,12 +1225,12 @@ export async function restartDriverRuntime(runtimeId: string): Promise<void> {
   return invoke("restart_driver_runtime", { runtimeId });
 }
 
-export async function installAgent(dbType: string): Promise<void> {
-  return invoke("install_agent", { dbType });
+export async function installAgent(dbType: string, source?: UpdateDownloadSource): Promise<void> {
+  return invoke("install_agent", { dbType, source });
 }
 
-export async function upgradeAllAgents(): Promise<UpgradeAllAgentDriversResult> {
-  return invoke("upgrade_all_agents");
+export async function upgradeAllAgents(source?: UpdateDownloadSource): Promise<UpgradeAllAgentDriversResult> {
+  return invoke("upgrade_all_agents", { source });
 }
 
 export async function checkAgentUpdateBlockers(dbTypes: string[]): Promise<AgentUpdateBlocker[]> {
@@ -1267,8 +1267,8 @@ export async function importAgentJar(dbType: string, path: string | File): Promi
   return invoke("import_agent_jar_cmd", { dbType, path });
 }
 
-export async function reinstallJre(jreKey?: string): Promise<void> {
-  return invoke("reinstall_jre", { jreKey });
+export async function reinstallJre(jreKey?: string, source?: UpdateDownloadSource): Promise<void> {
+  return invoke("reinstall_jre", { jreKey, source });
 }
 
 export async function uninstallJre(jreKey: string): Promise<void> {
@@ -2391,18 +2391,19 @@ export async function exportTableDataCsv(options: TableCsvExportOptions): Promis
   return invoke("export_table_data_csv", { request: options });
 }
 
-export async function exportQueryResultXlsx(filePath: string, sheetName: string | undefined, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
+export async function exportQueryResultXlsx(filePath: string, sheetName: string | undefined, columns: string[], columnTypes: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
   return invoke("export_query_result_xlsx", {
     request: {
       filePath,
       sheetName,
       columns,
+      columnTypes,
       rows,
     },
   });
 }
 
-export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
+export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; columnTypes?: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
   return invoke("export_query_results_xlsx", {
     request: {
       filePath,

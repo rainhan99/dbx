@@ -5,7 +5,7 @@ import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { canReloadUnavailableDataTab } from "@/lib/table/tableDataRefresh";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { Check, Columns3, Columns3Cog, EyeOff, Loader2, Search, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Timer, Wrench, Toolbox, ListChecks, Database, Download, Upload, X, Pin, Rows3, SquareDashed, Minus, Plus } from "@lucide/vue";
+import { Check, Columns3, Columns3Cog, EyeOff, Loader2, Search, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Wrench, Toolbox, Database, Download, Upload, X, Pin, Rows3, SquareDashed, Minus, Plus, ShieldAlert } from "@lucide/vue";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,8 @@ import QueryEditor from "@/components/editor/QueryEditor.vue";
 import ColumnInfoPanel from "@/components/editor/ColumnInfoPanel.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import QueryErrorActions from "@/components/common/QueryErrorActions.vue";
+import QueryResultToolbarActions from "@/components/layout/QueryResultToolbarActions.vue";
+import QueryResultViewSwitcher from "@/components/layout/QueryResultViewSwitcher.vue";
 import type { ColumnInfo } from "@/components/editor/ColumnInfoPanel.vue";
 let dataGridComponentPromise: Promise<typeof import("@/components/grid/DataGrid.vue")> | undefined;
 function loadDataGridComponent() {
@@ -46,6 +48,7 @@ const DocumentBrowser = defineAsyncComponent(() => import("@/components/document
 const MongoGridFsBrowser = defineAsyncComponent(() => import("@/components/document/MongoGridFsBrowser.vue"));
 const MongoBucketBrowser = defineAsyncComponent(() => import("@/components/document/MongoBucketBrowser.vue"));
 const VectorBrowser = defineAsyncComponent(() => import("@/components/vector/VectorBrowser.vue"));
+const ElasticsearchJsonResponsePanel = defineAsyncComponent(() => import("@/components/common/ElasticsearchJsonResponsePanel.vue"));
 const MqAdminConsole = defineAsyncComponent(() => import("@/components/mq/MqAdminConsole.vue"));
 const NacosAdminConsole = defineAsyncComponent(() => import("@/components/nacos/NacosAdminConsole.vue"));
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
@@ -59,7 +62,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridSearchMode } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
-import { databaseDisplayNameForTab, executionSummaryItems, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, resultSqlForGrid, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import { databaseDisplayNameForTab, executionSummaryItems, resultGridCacheKey, resultRunItems, resultSqlForGrid, tabularResultItems } from "@/lib/tabs/tabPresentation";
 import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { isTableDataEditable } from "@/lib/table/tableEditing";
@@ -68,16 +71,18 @@ import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { chartableColumnIndexes } from "@/lib/dataGrid/chartData";
+import { elasticsearchJsonResponseForResult } from "@/lib/elasticsearch/elasticsearchJsonResponse";
 import * as api from "@/lib/backend/api";
 import { applyMongoGridChangesToDocument, buildMongoUpdateDocument, formatMongoShellLiteral, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import type { SqlExecutionOverride } from "@/lib/sql/sqlExecutionTarget";
 import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
+import { DATA_GRID_COMPACT_TOPBAR_WIDTH, type DataGridReloadIntent } from "@/lib/dataGrid/dataGridToolbar";
 import { useTabScroll } from "@/composables/useTabScroll";
-import { nextResultToolbarLayout } from "@/lib/tabs/resultToolbarLayout";
 import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta, ObjectBrowserViewport } from "@/types/database";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
+import { productionContextForDatabase } from "@/lib/database/productionSafety";
 
 type DataGridHandle = {
   onToolbarRefresh: () => Promise<void> | void;
@@ -137,7 +142,7 @@ const emit = defineEmits<{
   editorViewportChange: [tabId: string, viewport: { scrollTop: number; scrollLeft: number }];
   editorSelectionStateChange: [tabId: string, selection: { anchor: number; head: number }];
   formatError: [];
-  reload: [sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number];
+  reload: [sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number, intent?: DataGridReloadIntent];
   paginate: [offset: number, limit: number, whereInput?: string, orderBy?: string];
   sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string, mode?: DataGridSortMode];
   executeSql: [sql: string];
@@ -186,7 +191,8 @@ const columnInfoLoading = ref(false);
 const columnInfoError = ref<string | undefined>(undefined);
 const dataGridRef = ref<DataGridHandle>();
 const queryEditorRef = ref<InstanceType<typeof QueryEditor>>();
-const resultToolbarRef = ref<HTMLElement | null>(null);
+const standaloneResultToolbarRef = ref<HTMLElement | null>(null);
+const standaloneResultToolbarWidth = ref(0);
 const resultTabsScrollerRef = ref<HTMLElement | null>(null);
 const columnVisibilitySearch = ref("");
 const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? []);
@@ -203,6 +209,13 @@ const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.activeConnection));
 const activeDataTabExecutionDatabase = computed(() => dataTabExecutionDatabase(props.activeConnection, props.activeTab.database, activeDataTabTableMeta.value?.catalog));
+const activeProductionContext = computed(() => productionContextForDatabase(props.activeConnection, props.activeTab.database));
+const productionWatermarkText = computed(() => (locale.value.startsWith("zh") ? "生产环境" : "PROD"));
+const productionSessionDetail = computed(() => {
+  if (!activeProductionContext.value.active) return "";
+  if (activeProductionContext.value.reason === "connection") return t("production.connection");
+  return activeProductionContext.value.databases.join(", ") || t("production.databases");
+});
 
 function findNodeInTree(nodes: TreeNode[], id: string): TreeNode | undefined {
   for (const node of nodes) {
@@ -310,14 +323,11 @@ const resultRuns = computed(() => resultRunItems(props.activeTab));
 const activeResultRunItem = computed(() => resultRuns.value.find((run) => run.active));
 const activeResultGridCacheKey = computed(() => resultGridCacheKey(props.activeTab));
 const activeResultSql = computed(() => resultSqlForGrid(props.activeTab));
+const activeElasticsearchJsonResponse = computed(() => elasticsearchJsonResponseForResult(activeEffectiveDatabaseType.value, activeResultSql.value, props.activeTab.result));
 const resultArchiveExporting = ref(false);
 const canExportResultArchive = computed(() => props.activeTab.mode === "query" && (!!props.activeTab.result || !!props.activeTab.results?.length || !!props.activeTab.resultRuns?.length));
 const resultAutoSave = computed(() => props.activeTab.resultAutoSave === true);
-const QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS = [5, 10, 30, 60, 300];
-const queryResultAutoRefreshIntervalSeconds = ref(10);
-const queryResultAutoRefreshEnabled = ref(false);
-let queryResultAutoRefreshTimer: ReturnType<typeof setInterval> | undefined;
-const queryResultAutoRefreshLabel = computed(() => (queryResultAutoRefreshEnabled.value ? t("tabs.autoRefreshEvery", { seconds: queryResultAutoRefreshIntervalSeconds.value }) : t("tabs.autoRefresh")));
+const showResultRunSelector = computed(() => resultAutoSave.value && resultRuns.value.length > 0);
 watch(
   () => visibleResultItems.value.map((item) => item.index).join(","),
   () => {
@@ -331,80 +341,25 @@ const hasTabularResult = computed(() => {
   return visibleResultItems.value.length > 0;
 });
 const canShowResultOutput = computed(() => hasTabularResult.value || props.activeTab.isExecuting);
-const resultToolbarCompact = ref(false);
-const resultToolbarExpandedRequiredWidth = ref<number>();
-let resultToolbarResizeObserver: ResizeObserver | undefined;
-let resultToolbarLayoutFrame = 0;
+const canShowExplainOutput = computed(() => !!props.activeTab.explainPlan || !!props.activeTab.explainError || !!props.activeTab.explainTableResult || !!props.activeTab.explainTableError || props.activeTab.isExplaining === true);
+const showStandaloneResultToolbar = computed(() => activeElasticsearchJsonResponse.value || props.activeOutputView !== "result" || !props.activeTab.result || !hasTabularResult.value);
+const standaloneResultToolbarCompact = computed(() => standaloneResultToolbarWidth.value > 0 && standaloneResultToolbarWidth.value < DATA_GRID_COMPACT_TOPBAR_WIDTH);
+let standaloneResultToolbarResizeObserver: ResizeObserver | undefined;
 
-function updateResultToolbarLayout() {
-  const toolbar = resultToolbarRef.value;
-  const tabs = resultTabsScrollerRef.value;
-  if (!toolbar || !tabs) return;
-
-  const next = nextResultToolbarLayout({
-    resultCount: visibleResultItems.value.length,
-    compact: resultToolbarCompact.value,
-    expandedRequiredWidth: resultToolbarExpandedRequiredWidth.value,
-    toolbarWidth: toolbar.clientWidth,
-    tabsViewportWidth: tabs.clientWidth,
-    tabsContentWidth: tabs.scrollWidth,
-  });
-  const compactChanged = next.compact !== resultToolbarCompact.value;
-  resultToolbarCompact.value = next.compact;
-  resultToolbarExpandedRequiredWidth.value = next.expandedRequiredWidth;
-  if (compactChanged) {
-    nextTick(() => {
-      updateResultTabsScrollbar();
-      scheduleResultToolbarLayout();
+function observeStandaloneResultToolbar() {
+  standaloneResultToolbarResizeObserver?.disconnect();
+  standaloneResultToolbarResizeObserver = undefined;
+  const toolbar = standaloneResultToolbarRef.value;
+  standaloneResultToolbarWidth.value = toolbar?.clientWidth ?? 0;
+  if (toolbar && typeof ResizeObserver !== "undefined") {
+    standaloneResultToolbarResizeObserver = new ResizeObserver(() => {
+      standaloneResultToolbarWidth.value = toolbar.clientWidth;
     });
+    standaloneResultToolbarResizeObserver.observe(toolbar);
   }
 }
 
-function scheduleResultToolbarLayout() {
-  if (resultToolbarLayoutFrame) return;
-  resultToolbarLayoutFrame = window.requestAnimationFrame(() => {
-    resultToolbarLayoutFrame = 0;
-    updateResultToolbarLayout();
-  });
-}
-
-function resetResultToolbarLayout() {
-  resultToolbarCompact.value = false;
-  resultToolbarExpandedRequiredWidth.value = undefined;
-  nextTick(() => {
-    updateResultTabsScrollbar();
-    scheduleResultToolbarLayout();
-  });
-}
-
-function observeResultToolbarLayout() {
-  resultToolbarResizeObserver?.disconnect();
-  resultToolbarResizeObserver = undefined;
-  const toolbar = resultToolbarRef.value;
-  const tabs = resultTabsScrollerRef.value;
-  if (typeof ResizeObserver !== "undefined" && toolbar && tabs) {
-    resultToolbarResizeObserver = new ResizeObserver(scheduleResultToolbarLayout);
-    resultToolbarResizeObserver.observe(toolbar);
-    resultToolbarResizeObserver.observe(tabs);
-  }
-  scheduleResultToolbarLayout();
-}
-
-const resultToolbarLayoutSignature = computed(() =>
-  JSON.stringify({
-    locale: locale.value,
-    results: visibleResultItems.value.map((item) => [item.index, item.label, item.n]),
-    outputView: props.activeOutputView,
-    canExportResultArchive: canExportResultArchive.value,
-    hasResult: !!props.activeTab.result,
-    hasTabularResult: hasTabularResult.value,
-    autoRefreshEnabled: queryResultAutoRefreshEnabled.value,
-    autoRefreshInterval: queryResultAutoRefreshIntervalSeconds.value,
-  }),
-);
-
-watch([resultToolbarRef, resultTabsScrollerRef], observeResultToolbarLayout, { flush: "post" });
-watch(resultToolbarLayoutSignature, resetResultToolbarLayout, { flush: "post" });
+watch(standaloneResultToolbarRef, observeStandaloneResultToolbar, { flush: "post" });
 type MongoQueryGridChanges = {
   dirtyRows: Map<number, Map<number, MongoInputValue>>;
   deletedRows: Set<number>;
@@ -482,7 +437,6 @@ const resultsPaneOpen = ref(false);
 const resultsPaneSize = ref(Number(safeLocalStorageGet("dbx-results-pane-size")) || DEFAULT_QUERY_RESULTS_PANE_SIZE);
 const editorPaneSize = computed(() => (resultsPaneOpen.value ? 100 - resultsPaneSize.value : 100));
 const queryRunningElapsed = ref(0);
-const canAutoRefreshQueryResult = computed(() => props.activeTab.mode === "query" && props.activeOutputView === "result" && resultsPaneOpen.value && hasTabularResult.value && !props.activeTab.isExecuting);
 
 function onResultsResized(payload: { panes: { size: number }[] }) {
   const resultsPane = payload.panes[1];
@@ -524,29 +478,8 @@ watch(() => [props.activeTab.id, props.activeTab.isExecuting, props.activeTab.qu
 
 onUnmounted(() => {
   stopQueryRunningElapsedTimer();
-  stopQueryResultAutoRefreshTimer();
-  resultToolbarResizeObserver?.disconnect();
-  if (resultToolbarLayoutFrame) window.cancelAnimationFrame(resultToolbarLayoutFrame);
+  standaloneResultToolbarResizeObserver?.disconnect();
   window.removeEventListener("dbx-refresh-active-kv-browser", onRefreshActiveKvBrowser);
-});
-
-watch(() => props.activeTab.id, stopQueryResultAutoRefresh);
-
-watch(
-  () => [props.activeOutputView, resultsPaneOpen.value] as const,
-  ([outputView, paneOpen]) => {
-    if (outputView !== "result" || !paneOpen) stopQueryResultAutoRefresh();
-  },
-);
-
-watch(canAutoRefreshQueryResult, (canRefresh) => {
-  if (!queryResultAutoRefreshEnabled.value) return;
-  if (canRefresh) restartQueryResultAutoRefreshTimer();
-  else stopQueryResultAutoRefreshTimer();
-});
-
-watch(activeQueryError, (message) => {
-  if (message && queryResultAutoRefreshEnabled.value) stopQueryResultAutoRefresh();
 });
 
 watch(
@@ -734,43 +667,18 @@ function focusSearch(): boolean {
   return dataGridRef.value?.focusSearch() ?? false;
 }
 
-function stopQueryResultAutoRefreshTimer() {
-  clearInterval(queryResultAutoRefreshTimer);
-  queryResultAutoRefreshTimer = undefined;
-}
-
-function runQueryResultAutoRefreshTick() {
-  if (!queryResultAutoRefreshEnabled.value || !canAutoRefreshQueryResult.value) return;
-  refreshData();
-}
-
-function restartQueryResultAutoRefreshTimer() {
-  stopQueryResultAutoRefreshTimer();
-  if (!queryResultAutoRefreshEnabled.value || !canAutoRefreshQueryResult.value) return;
-  queryResultAutoRefreshTimer = setInterval(runQueryResultAutoRefreshTick, queryResultAutoRefreshIntervalSeconds.value * 1000);
-}
-
-function setQueryResultAutoRefreshInterval(seconds: number) {
-  queryResultAutoRefreshIntervalSeconds.value = seconds;
-  if (queryResultAutoRefreshEnabled.value) restartQueryResultAutoRefreshTimer();
-}
-
-function toggleQueryResultAutoRefresh() {
-  queryResultAutoRefreshEnabled.value = !queryResultAutoRefreshEnabled.value;
-  restartQueryResultAutoRefreshTimer();
-}
-
-function stopQueryResultAutoRefresh() {
-  queryResultAutoRefreshEnabled.value = false;
-  stopQueryResultAutoRefreshTimer();
-}
-
 function refreshData(): boolean {
   if (props.activeTab.mode === "etcd") return etcdKeyBrowserRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "zookeeper") return zookeeperKeyBrowserRef.value?.refresh?.() ?? false;
   // Restored data tabs intentionally omit row data, so refresh must work before DataGrid mounts.
   if (canReloadUnavailableDataTab(props.activeTab)) {
     emit("reload");
+    return true;
+  }
+  if (activeElasticsearchJsonResponse.value) {
+    // Match DataGrid's toolbar refresh intent so multi-result runs are
+    // refreshed as a group instead of replacing them with the active result.
+    emit("reload", activeResultSql.value, undefined, undefined, undefined, undefined, undefined, "refresh");
     return true;
   }
   if (!dataGridRef.value) return false;
@@ -802,10 +710,6 @@ async function exportResultArchive() {
   }
 }
 
-function toggleExecutionSummary() {
-  emit("update:activeOutputView", nextExecutionSummaryView(props.activeOutputView, canShowResultOutput.value));
-}
-
 async function removeResultRun(runId: string) {
   const removedActiveRun = props.activeTab.activeResultRunId === runId;
   const removed = await queryStore.removeResultRun(props.activeTab.id, runId);
@@ -828,7 +732,7 @@ function toggleResultAutoSave() {
 function handleModRTarget(target: Element): boolean {
   if (target.closest("[data-query-editor-root]")) return queryEditorRef.value?.openReplace() ?? false;
   if (target.closest("[data-cell-detail-editor-root]")) return dataGridRef.value?.openCellDetailSearch() ?? false;
-  if (target.closest("[data-grid-root]")) return refreshData();
+  if (target.closest("[data-grid-root], [data-elasticsearch-json-response-root]")) return refreshData();
   if (canReloadUnavailableDataTab(props.activeTab)) return refreshData();
   return false;
 }
@@ -845,15 +749,23 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
 </script>
 
 <template>
-  <div class="flex flex-col flex-1 min-h-0">
+  <div class="production-session-shell flex flex-col flex-1 min-h-0" :class="{ 'production-session-shell--active': activeProductionContext.active }">
+    <div v-if="activeProductionContext.active" class="production-session-strip flex h-7 shrink-0 items-center gap-2 border-b border-red-500/35 bg-red-500/10 px-3 text-xs font-semibold text-red-800 shadow-[inset_0_1px_0_rgb(239_68_68_/_0.28)] dark:text-red-200">
+      <ShieldAlert class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <span class="font-mono uppercase tracking-normal">{{ t("production.title") }}</span>
+      <span v-if="productionSessionDetail" class="min-w-0 truncate rounded-[4px] border border-red-500/25 bg-background/65 px-1.5 py-0.5 font-medium text-red-700 dark:text-red-200">{{ productionSessionDetail }}</span>
+    </div>
     <!-- Query mode: editor + results -->
     <template v-if="activeTab.mode === 'query'">
       <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden" @resized="onResultsResized">
         <Pane class="min-h-0" :size="editorPaneSize" :min-size="resultsPaneOpen ? 15 : 100">
           <div class="h-full flex flex-col relative">
+            <div v-if="activeProductionContext.active" class="production-watermark pointer-events-none absolute inset-0 z-10 grid select-none" aria-hidden="true">
+              <span v-for="index in 4" :key="index" class="production-watermark__label whitespace-nowrap font-mono text-6xl font-extrabold text-red-700/[0.24] dark:text-red-200/[0.2]">{{ productionWatermarkText }}</span>
+            </div>
             <QueryEditor
               ref="queryEditorRef"
-              class="flex-1"
+              class="relative z-0 flex-1"
               :model-value="activeTab.sql"
               :connection-id="activeTab.connectionId"
               :database="activeTab.database"
@@ -891,18 +803,13 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
         </Pane>
         <Pane v-if="resultsPaneOpen" class="min-h-0" :size="resultsPaneSize" :min-size="20">
           <div class="h-full flex flex-col">
-            <div v-if="hasQueryOutput" ref="resultToolbarRef" class="flex h-10 shrink-0 items-center gap-1 border-b bg-muted/20 px-2">
-              <div class="flex shrink-0 items-center gap-1">
-                <Button size="sm" :variant="activeOutputView === 'result' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs" :disabled="!hasTabularResult && !activeTab.isExecuting" @click="emit('update:activeOutputView', 'result')">
-                  {{ t("tabs.tableData") }}
-                </Button>
-              </div>
+            <div v-if="hasQueryOutput" class="flex h-10 shrink-0 items-center gap-1 border-b bg-muted/20 px-2">
               <Button
                 v-if="activeTab.mode === 'query' && activeTab.result"
                 variant="ghost"
                 size="icon"
-                class="h-6 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-                :class="{ 'text-primary': resultAutoSave }"
+                class="h-6 w-7 shrink-0"
+                :class="resultAutoSave ? 'bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary' : 'text-muted-foreground hover:bg-accent hover:text-foreground'"
                 :title="resultAutoSave ? t('tabs.autoKeepResultsEnabled') : t('tabs.autoKeepResults')"
                 :aria-label="resultAutoSave ? t('tabs.autoKeepResultsEnabled') : t('tabs.autoKeepResults')"
                 :aria-pressed="resultAutoSave"
@@ -910,7 +817,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
               >
                 <Pin class="h-3.5 w-3.5" :class="{ 'fill-current': resultAutoSave }" />
               </Button>
-              <template v-if="resultRuns.length > 0">
+              <template v-if="showResultRunSelector">
                 <span class="mx-1 h-4 w-px shrink-0 bg-border" />
                 <DropdownMenu>
                   <DropdownMenuTrigger as-child>
@@ -961,71 +868,8 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   </div>
                 </div>
               </template>
-              <div class="ml-auto flex shrink-0 items-center gap-1" :data-compact="resultToolbarCompact || undefined">
-                <LightTooltip :text="t('tabs.executionSummary')" :disabled="!resultToolbarCompact" side="bottom" :delay="0" :close-delay="0" nowrap>
-                  <Button
-                    size="sm"
-                    :variant="activeOutputView === 'summary' ? 'secondary' : 'ghost'"
-                    class="h-6 text-xs"
-                    :class="resultToolbarCompact ? 'w-7 gap-0 px-0' : 'gap-1 px-2'"
-                    :title="t('tabs.executionSummary')"
-                    :aria-label="t('tabs.executionSummary')"
-                    :disabled="!hasExecutionSummary"
-                    @click="toggleExecutionSummary"
-                  >
-                    <ListChecks class="h-3.5 w-3.5" />
-                    <span v-if="!resultToolbarCompact">{{ t("tabs.executionSummary") }}</span>
-                  </Button>
-                </LightTooltip>
-                <LightTooltip :text="t('chart.title')" :disabled="!resultToolbarCompact" side="bottom" :delay="0" :close-delay="0" nowrap>
-                  <Button
-                    size="sm"
-                    :variant="activeOutputView === 'chart' ? 'secondary' : 'ghost'"
-                    class="h-6 text-xs"
-                    :class="resultToolbarCompact ? 'w-7 gap-0 px-0' : 'gap-1 px-2'"
-                    :title="t('chart.title')"
-                    :aria-label="t('chart.title')"
-                    :disabled="!hasNumericData"
-                    @click="emit('update:activeOutputView', 'chart')"
-                  >
-                    <BarChart3 class="h-3.5 w-3.5" />
-                    <span v-if="!resultToolbarCompact">{{ t("chart.title") }}</span>
-                  </Button>
-                </LightTooltip>
-                <span class="mx-1 h-4 w-px shrink-0 bg-border" />
-                <LightTooltip :text="t('explain.title')" :disabled="!resultToolbarCompact" side="bottom" :delay="0" :close-delay="0" nowrap>
-                  <Button
-                    size="sm"
-                    :variant="activeOutputView === 'explain' ? 'secondary' : 'ghost'"
-                    class="h-6 text-xs"
-                    :class="resultToolbarCompact ? 'w-7 gap-0 px-0' : 'gap-1 px-2'"
-                    :title="t('explain.title')"
-                    :aria-label="t('explain.title')"
-                    :disabled="!activeTab.explainPlan && !activeTab.explainError && !activeTab.explainTableResult && !activeTab.explainTableError && !activeTab.isExplaining"
-                    @click="emit('update:activeOutputView', 'explain')"
-                  >
-                    <GitBranch class="h-3.5 w-3.5" />
-                    <span v-if="!resultToolbarCompact">{{ t("explain.title") }}</span>
-                  </Button>
-                </LightTooltip>
-                <LightTooltip v-if="canExportResultArchive" :text="t('tabs.exportResultArchive')" :disabled="!resultToolbarCompact" side="bottom" :delay="0" :close-delay="0" nowrap>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    class="h-6 shrink-0 text-xs text-muted-foreground hover:text-foreground"
-                    :class="resultToolbarCompact ? 'w-7 gap-0 px-0' : 'gap-1 px-2'"
-                    :title="t('tabs.exportResultArchive')"
-                    :aria-label="t('tabs.exportResultArchive')"
-                    :aria-busy="resultArchiveExporting"
-                    :disabled="resultArchiveExporting"
-                    @click="exportResultArchive"
-                  >
-                    <Loader2 v-if="resultArchiveExporting" class="h-3.5 w-3.5 animate-spin" />
-                    <Upload v-else class="h-3.5 w-3.5" />
-                    <span v-if="!resultToolbarCompact">{{ t("tabs.exportResultArchive") }}</span>
-                  </Button>
-                </LightTooltip>
-                <Popover v-if="activeOutputView === 'result' && activeTab.result">
+              <div class="ml-auto flex shrink-0 items-center gap-1">
+                <Popover v-if="activeOutputView === 'result' && activeTab.result && hasTabularResult && !activeElasticsearchJsonResponse">
                   <PopoverTrigger as-child>
                     <Button variant="ghost" size="icon" class="h-6 w-7 shrink-0 text-foreground hover:bg-accent" :title="t('grid.viewOptions')" :aria-label="t('grid.viewOptions')">
                       <Wrench class="h-4 w-4" />
@@ -1168,70 +1012,33 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                     </div>
                   </PopoverContent>
                 </Popover>
-                <div v-if="activeOutputView === 'result' && hasTabularResult" class="flex h-6 shrink-0 items-center">
-                  <LightTooltip :text="t('grid.refresh')" :disabled="!resultToolbarCompact" side="bottom" :delay="0" :close-delay="0" nowrap>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      class="h-6 rounded-r-none text-xs text-muted-foreground hover:text-foreground"
-                      :class="resultToolbarCompact ? 'w-7 gap-0 px-0' : 'gap-1 px-2'"
-                      :title="t('grid.refresh')"
-                      :aria-label="t('grid.refresh')"
-                      :aria-busy="activeTab.isExecuting"
-                      :disabled="activeTab.isExecuting"
-                      @click="refreshData"
-                    >
-                      <Loader2 v-if="activeTab.isExecuting" class="h-3.5 w-3.5 animate-spin" />
-                      <RefreshCcw v-else class="h-3.5 w-3.5" />
-                      <span v-if="!resultToolbarCompact">{{ t("grid.refresh") }}</span>
-                    </Button>
-                  </LightTooltip>
-                  <LightTooltip :text="queryResultAutoRefreshLabel" :disabled="!resultToolbarCompact" side="bottom" :delay="0" :close-delay="0" nowrap>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger as-child>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          class="h-6 rounded-l-none border-l border-border/60 text-xs"
-                          :class="[resultToolbarCompact ? 'w-7 gap-0 px-0' : 'px-1.5', queryResultAutoRefreshEnabled ? 'bg-primary/10 text-primary hover:bg-primary/15' : 'text-muted-foreground hover:text-foreground']"
-                          :title="queryResultAutoRefreshLabel"
-                          :aria-label="queryResultAutoRefreshLabel"
-                          :aria-pressed="queryResultAutoRefreshEnabled"
-                        >
-                          <Timer class="h-3.5 w-3.5" />
-                          <span v-if="!resultToolbarCompact" class="tabular-nums">{{ queryResultAutoRefreshEnabled ? `${queryResultAutoRefreshIntervalSeconds}s` : t("tabs.autoRefreshShort") }}</span>
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" class="w-40">
-                        <DropdownMenuItem class="gap-2" @select="toggleQueryResultAutoRefresh">
-                          <Check v-if="queryResultAutoRefreshEnabled" class="h-3.5 w-3.5" />
-                          <span v-else class="h-3.5 w-3.5" />
-                          {{ queryResultAutoRefreshEnabled ? t("tabs.stopAutoRefresh") : t("tabs.startAutoRefresh") }}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem v-for="seconds in QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS" :key="seconds" class="gap-2" @select="setQueryResultAutoRefreshInterval(seconds)">
-                          <Check v-if="queryResultAutoRefreshIntervalSeconds === seconds" class="h-3.5 w-3.5" />
-                          <span v-else class="h-3.5 w-3.5" />
-                          {{ t("tabs.autoRefreshEvery", { seconds }) }}
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </LightTooltip>
-                </div>
-                <LightTooltip :text="t('editor.hideResultsPane')" :disabled="!resultToolbarCompact" side="bottom" :delay="0" :close-delay="0" nowrap>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    class="h-6 shrink-0 text-xs text-muted-foreground hover:text-foreground"
-                    :class="resultToolbarCompact ? 'w-7 gap-0 px-0' : 'gap-1 px-2'"
-                    :title="t('editor.hideResultsPane')"
-                    :aria-label="t('editor.hideResultsPane')"
-                    @click="resultsPaneOpen = false"
-                  >
+                <LightTooltip :text="t('editor.hideResultsPane')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                  <Button variant="ghost" size="icon" class="h-6 w-7 shrink-0 text-muted-foreground hover:text-foreground" :title="t('editor.hideResultsPane')" :aria-label="t('editor.hideResultsPane')" @click="resultsPaneOpen = false">
                     <ChevronDown class="h-3.5 w-3.5" />
-                    <span v-if="!resultToolbarCompact">{{ t("editor.hideResultsPane") }}</span>
                   </Button>
                 </LightTooltip>
               </div>
+            </div>
+
+            <div v-if="hasQueryOutput && showStandaloneResultToolbar" ref="standaloneResultToolbarRef" class="flex min-h-7 shrink-0 items-center border-b bg-muted/20">
+              <QueryResultViewSwitcher
+                :active-view="activeOutputView"
+                :can-show-result="canShowResultOutput"
+                :can-show-summary="hasExecutionSummary"
+                :can-show-chart="hasNumericData && !activeElasticsearchJsonResponse"
+                :compact="standaloneResultToolbarCompact"
+                @select-view="emit('update:activeOutputView', $event)"
+              />
+              <QueryResultToolbarActions
+                class="ml-auto"
+                :active-view="activeOutputView"
+                :can-show-explain="canShowExplainOutput"
+                :can-export-archive="canExportResultArchive"
+                :archive-exporting="resultArchiveExporting"
+                :compact="standaloneResultToolbarCompact"
+                @select-explain="emit('update:activeOutputView', 'explain')"
+                @export-archive="exportResultArchive"
+              />
             </div>
 
             <ExplainPlanViewer
@@ -1246,7 +1053,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
               :table-error="activeTab.explainTableError"
             />
 
-            <QueryChart v-else-if="activeOutputView === 'chart' && activeTab.result" class="flex-1 min-h-0" :result="activeTab.result" />
+            <QueryChart v-else-if="activeOutputView === 'chart' && activeTab.result && !activeElasticsearchJsonResponse" class="flex-1 min-h-0" :result="activeTab.result" />
 
             <div v-else-if="activeOutputView === 'summary'" class="flex-1 min-h-0 overflow-auto bg-background">
               <div v-if="activeTab.isExecuting" class="flex h-full items-center justify-center text-sm text-muted-foreground">
@@ -1284,8 +1091,9 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
             </div>
 
             <template v-else>
+              <ElasticsearchJsonResponsePanel v-if="activeElasticsearchJsonResponse" class="flex-1 min-h-0" :status="activeElasticsearchJsonResponse.status" :body="activeElasticsearchJsonResponse.body" />
               <DataGrid
-                v-if="activeTab.result && hasTabularResult"
+                v-else-if="activeTab.result && hasTabularResult"
                 ref="dataGridRef"
                 :key="activeResultGridCacheKey"
                 :cache-key="activeResultGridCacheKey"
@@ -1322,10 +1130,24 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 :all-export-results="allResultExportSheets"
                 :export-file-base-name="activeTab.title"
                 @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
-                @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
+                @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number, intent?: DataGridReloadIntent) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset, intent)"
                 @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
                 @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => emit('sort', column, columnIndex, direction, whereInput, mode)"
               >
+                <template #result-toolbar-leading="{ compact }">
+                  <QueryResultViewSwitcher :active-view="activeOutputView" :can-show-result="canShowResultOutput" :can-show-summary="hasExecutionSummary" :can-show-chart="hasNumericData && !activeElasticsearchJsonResponse" :compact="compact" @select-view="emit('update:activeOutputView', $event)" />
+                </template>
+                <template #result-toolbar-actions="{ compact }">
+                  <QueryResultToolbarActions
+                    :active-view="activeOutputView"
+                    :can-show-explain="canShowExplainOutput"
+                    :can-export-archive="canExportResultArchive"
+                    :archive-exporting="resultArchiveExporting"
+                    :compact="compact"
+                    @select-explain="emit('update:activeOutputView', 'explain')"
+                    @export-archive="exportResultArchive"
+                  />
+                </template>
                 <template v-if="activeTab.result?.columns.includes('Error')" #error-actions="{ errorMessage }">
                   <QueryErrorActions :error-message="String(errorMessage)" :connection-id="activeTab.connectionId" @change-query-timeout="activeTab.connectionId && emit('openConnectionSettings', activeTab.connectionId, 'advanced')" @fix-with-ai="(message) => emit('fixWithAi', message)" />
                 </template>
@@ -1618,12 +1440,14 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
           :table-info-tab="activeTab.tableInfoTab"
           :page-offset="activeTab.resultPageOffset"
           :page-limit="activeTab.resultPageLimit"
+          :total-row-count="activeTab.resultTotalRowCount"
+          :total-row-count-loading="activeTab.resultTotalRowCountLoading"
           :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
           :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
           :export-file-base-name="activeTab.title"
           @update:where-input="(v: string) => (activeTab.whereInput = v)"
           @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
-          @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
+          @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number, intent?: DataGridReloadIntent) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset, intent)"
           @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
           @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => emit('sort', column, columnIndex, direction, whereInput, mode)"
         >
@@ -1765,9 +1589,39 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
   isolation: isolate;
 }
 
+.production-session-shell--active {
+  box-shadow: inset 3px 0 0 color-mix(in oklch, var(--destructive) 78%, transparent);
+}
+
+.production-session-strip {
+  background-image: linear-gradient(90deg, color-mix(in oklch, var(--destructive) 14%, transparent), color-mix(in oklch, var(--destructive) 7%, transparent));
+}
+
 .query-output-splitpanes :deep(> .splitpanes__splitter) {
   z-index: 1;
   flex: 0 0 3px;
+}
+
+.production-watermark {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 3rem;
+  overflow: hidden;
+  padding: 3rem 2.5rem;
+}
+
+.production-watermark__label {
+  align-self: center;
+  justify-self: center;
+  transform: rotate(-22deg);
+}
+
+@media (max-width: 700px) {
+  .production-watermark {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+    padding-inline: 1rem;
+  }
 }
 
 .result-tab-scroll::-webkit-scrollbar {

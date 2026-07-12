@@ -13,6 +13,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
+import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { useQueryStore } from "@/stores/queryStore";
 import { useHistoryStore } from "@/stores/historyStore";
 import { useSettingsStore, type StructureEditorDensity } from "@/stores/settingsStore";
@@ -25,8 +27,13 @@ import { queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { type BuildTableStructureChangeSqlOptions, type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql";
 import { PRESET_FIELDS_TEMPLATE_ID, createTableColumnTemplateDrafts } from "@/lib/table/tableColumnTemplates";
+import { getMysqlDataTypeHelp } from "@/lib/table/mysqlDataTypeHelp";
+import { getPostgresDataTypeHelp } from "@/lib/table/postgresDataTypeHelp";
+import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
-import { canAddTableStructureColumn, getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
+import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
+import { orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
+import { loadTableDataGridColumnOrder, notifyTableDataGridColumnOrderChanged, removeTableDataGridColumnOrder, saveTableDataGridColumnOrder, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 import { connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import type { TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
 import {
@@ -39,6 +46,7 @@ import {
   createIndexDrafts,
   createTriggerDrafts,
   dataTypeLengthInputValue,
+  defaultNewColumnDataType,
   generateIndexName,
   generateUniqueIndexName,
   getColumnEditorControls,
@@ -64,6 +72,7 @@ import * as api from "@/lib/backend/api";
 const { t } = useI18n();
 const { isDark } = useTheme();
 const store = useConnectionStore();
+const productionSafetyStore = useProductionSafetyStore();
 const queryStore = useQueryStore();
 const historyStore = useHistoryStore();
 const settingsStore = useSettingsStore();
@@ -188,7 +197,7 @@ function columnChanged(column: EditableStructureColumn, index: number): boolean 
   if (!column.original || column.markedForDrop) return true;
   const original = column.original;
   return (
-    column.originalPosition !== index ||
+    isPhysicalTableColumnOrderChange(databaseType.value, connection.value?.db_type, column.originalPosition, index) ||
     column.name !== original.name ||
     column.dataType !== original.data_type ||
     column.isNullable !== original.is_nullable ||
@@ -594,6 +603,7 @@ function onIndexColResize(e: MouseEvent, col: number) {
 
 const connection = computed(() => (props.connectionId ? store.getConfig(props.connectionId) : undefined));
 const databaseType = computed(() => tableStructureDatabaseTypeForConnection(connection.value));
+const usesMysql8SafeDefaults = computed(() => databaseType.value === "mysql" && connection.value?.db_type === "mysql" && connection.value.driver_profile === "mysql");
 const structureCapabilities = computed(() => getTableStructureCapabilities(databaseType.value, connection.value?.db_type));
 const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(databaseType.value));
 const structureDialect = computed(() => structureCapabilities.value.dialect);
@@ -1003,6 +1013,32 @@ function mergeDataTypeOptions(primary: readonly string[], fallback: readonly str
   return result;
 }
 
+function mysqlDataTypeTooltip(option: string): string | undefined {
+  if (databaseType.value !== "mysql") return undefined;
+  const product = connection.value?.driver_profile === "mariadb" ? "mariadb" : connection.value?.driver_profile === "mysql" ? "mysql" : undefined;
+  const help = getMysqlDataTypeHelp(option, { product });
+  return help ? [help.key, ...(help.warningKeys ?? [])].map((key) => t(`structureEditor.mysqlDataTypeHelp.${key}`)).join("\n\n") : undefined;
+}
+
+function postgresDataTypeTooltip(option: string): string | undefined {
+  if (databaseType.value !== "postgres") return undefined;
+  const help = getPostgresDataTypeHelp(option);
+  return help ? t(`structureEditor.postgresDataTypeHelp.${help.key}`) : undefined;
+}
+
+function sqliteDataTypeTooltip(option: string): string | undefined {
+  if (databaseType.value !== "sqlite") return undefined;
+  const help = getSqliteDataTypeHelp(option);
+  return help ? t(`structureEditor.sqliteDataTypeHelp.${help.key}`) : undefined;
+}
+
+function dataTypeTooltip(option: string): string | undefined {
+  if (databaseType.value === "mysql") return mysqlDataTypeTooltip(option);
+  if (databaseType.value === "postgres") return postgresDataTypeTooltip(option);
+  if (databaseType.value === "sqlite") return sqliteDataTypeTooltip(option);
+  return undefined;
+}
+
 async function loadDynamicDataTypeOptions() {
   const requestId = ++dataTypeOptionsRequestId;
   const connectionId = props.connectionId;
@@ -1149,6 +1185,7 @@ function resetState() {
   highlightedIndexId.value = null;
   appliedInitialTargetSearchKey = "";
   appliedInitialTargetScrollKey = "";
+  localColumnOrderNoticeShown.value = false;
 }
 
 async function reloadStructureFromDatabase() {
@@ -1213,7 +1250,7 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
       // Load live charset/collation metadata from the MySQL server so the column
       // editor shows the correct options for the server version.
       void loadCharsetMetadata();
-      columns.value = createColumnDrafts(nextColumns, databaseType.value);
+      columns.value = applyStoredLocalColumnOrder(createColumnDrafts(nextColumns, databaseType.value));
     }
 
     const nextTableComment = await tableCommentPromise;
@@ -1272,7 +1309,7 @@ async function refreshStructureAfterSave(scope: StructureRefreshScope) {
 async function addColumn() {
   if (!canAddColumn.value) return;
   activeTab.value = "columns";
-  const dataType = databaseType.value === "manticoresearch" ? combineDataTypeForDatabase(databaseType.value, dataTypeOptions.value[0] ?? "text", getDefaultLengthForType(databaseType.value, dataTypeOptions.value[0] ?? "text")) : "varchar(255)";
+  const dataType = defaultNewColumnDataType(databaseType.value, dataTypeOptions.value);
   const column: EditableStructureColumn = {
     id: `new:${uuid()}`,
     name: "",
@@ -1322,6 +1359,7 @@ type ColumnDragState = {
 };
 
 const columnDragState = ref<ColumnDragState | null>(null);
+const localColumnOrderNoticeShown = ref(false);
 let columnDragPreviousBodyUserSelect = "";
 let columnDragPreviousBodyCursor = "";
 let columnDragTracking = false;
@@ -1347,7 +1385,53 @@ function canDropColumnAt(sourceIndex: number, insertionIndex: number): boolean {
   return crossedColumns.every((column) => !column.original);
 }
 
-const canShowColumnDragControls = computed(() => isCreateMode.value || structureCapabilities.value.reorderColumn);
+const usesLocalTableColumnOrder = computed(() => !isCreateMode.value && supportsLocalTableColumnReorder(databaseType.value, connection.value?.db_type));
+const canShowColumnDragControls = computed(() => isCreateMode.value || structureCapabilities.value.reorderColumn || usesLocalTableColumnOrder.value);
+
+function localTableColumnOrderScopeKey(): string {
+  return tableDataGridColumnOrderScopeKey({
+    connectionId: props.connectionId,
+    database: props.database,
+    schema: props.schema,
+    tableName: props.tableName,
+  });
+}
+
+function localColumnOrderKeys(items: readonly EditableStructureColumn[]): string[] {
+  return uniqueDataGridColumnOrderKeys(items.map((column) => column.name));
+}
+
+const hasLocalColumnOrderChange = computed(() => {
+  if (!usesLocalTableColumnOrder.value) return false;
+  return hasLocalTableColumnOrderChange(columns.value);
+});
+
+function applyStoredLocalColumnOrder(items: EditableStructureColumn[]): EditableStructureColumn[] {
+  if (!usesLocalTableColumnOrder.value) return items;
+  const orderedKeys = loadTableDataGridColumnOrder(localTableColumnOrderScopeKey());
+  if (!orderedKeys.length) return items;
+  const columnKeys = uniqueDataGridColumnOrderKeys(items.map((column) => column.name));
+  const indexes = orderedColumnIndexes({
+    availableIndexes: items.map((_, index) => index),
+    columnKeys,
+    orderedKeys,
+  });
+  return indexes.map((index) => items[index]).filter((column): column is EditableStructureColumn => !!column);
+}
+
+function persistLocalColumnOrder(showNotice = true) {
+  if (!usesLocalTableColumnOrder.value) return;
+  const scopeKey = localTableColumnOrderScopeKey();
+  if (hasLocalColumnOrderChange.value) {
+    saveTableDataGridColumnOrder(scopeKey, localColumnOrderKeys(columns.value));
+  } else {
+    removeTableDataGridColumnOrder(scopeKey);
+  }
+  notifyTableDataGridColumnOrderChanged(scopeKey);
+  if (!showNotice || localColumnOrderNoticeShown.value) return;
+  localColumnOrderNoticeShown.value = true;
+  toast(t("structureEditor.localColumnOrderNotice"), 4000);
+}
 
 function isSqlServerIdentityChecked(column: EditableStructureColumn): boolean {
   return !!column.extra.autoIncrement || !!column.extra.identity;
@@ -1464,7 +1548,7 @@ function updateColumnDataType(column: EditableStructureColumn, baseType: string)
     if (!column.enumValues?.length) column.enumValues = [""];
     column.dataType = mysqlEnumDataType(column.enumValues);
   } else {
-    column.dataType = combineDataTypeForDatabase(databaseType.value, baseType, getDefaultLengthForType(databaseType.value, baseType));
+    column.dataType = combineDataTypeForDatabase(databaseType.value, baseType, getDefaultLengthForType(databaseType.value, baseType, { omitMysqlDeprecatedDefaults: usesMysql8SafeDefaults.value }));
   }
   syncSqlServerIdentityForDataType(column);
   syncDamengIdentityForDataType(column);
@@ -1507,6 +1591,7 @@ function moveColumnTo(index: number, insertionIndex: number) {
   const adjustedInsertionIndex = insertionIndex > index ? insertionIndex - 1 : insertionIndex;
   nextColumns.splice(adjustedInsertionIndex, 0, column);
   columns.value = nextColumns;
+  persistLocalColumnOrder();
 }
 
 function onColumnDragPointerDown(index: number, event: PointerEvent) {
@@ -2061,13 +2146,24 @@ function toggleSqlPreviewCollapsed() {
 
 async function applyChanges() {
   if (!canApply.value || !props.connectionId || !props.database) return;
+  const sql = previewSqlText.value;
+  const connection = store.getConfig(props.connectionId);
+  const productionContext = productionContextForDatabase(connection, props.database);
+  if (productionContext.active) {
+    const confirmed = await productionSafetyStore.requestConfirmation({
+      sql,
+      connectionName: connection?.name,
+      database: props.database,
+      productionDatabases: productionContext.databases,
+      source: t("production.sourceStructure"),
+    });
+    if (!confirmed) return;
+  }
   saving.value = true;
   errorMessage.value = "";
-  const sql = previewSqlText.value;
   const refreshScope = captureStructureRefreshScope();
   const startedAt = Date.now();
   try {
-    const connection = store.getConfig(props.connectionId);
     const result = hasSqliteTypeChange.value
       ? await api.applySqliteTableStructureChange(props.connectionId, props.database, structureChangeOptions(), sqliteSchemaRevision.value!)
       : await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, queryTimeoutSecsForConnection(connection));
@@ -2083,6 +2179,8 @@ async function applyChanges() {
       emit("saved", tableComment.value !== originalTableComment.value);
       emit("close");
     } else {
+      // Refresh persisted keys after successful renames/additions before metadata reloads.
+      persistLocalColumnOrder(false);
       saving.value = false;
       postSaveRefreshing.value = true;
       skipNextRefreshVersion = true;
@@ -2500,6 +2598,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                       :empty-text="t('structureEditor.noMatchingType')"
                       :loading-text="t('common.loading')"
                       :allow-custom="true"
+                      :option-tooltip="dataTypeTooltip"
                       :trigger-class="[structureMonoControlClass, 'w-full']"
                       @update:model-value="(v: string) => updateColumnDataType(column, v)"
                     />
@@ -2774,7 +2873,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                         type="button"
                         variant="ghost"
                         size="icon"
-                        :class="[structureActionButtonClass, canDragColumn(index) ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed']"
+                        :class="[structureActionButtonClass, canDragColumn(index) ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed', hasLocalColumnOrderChange ? 'border-primary/30 bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary' : '']"
                         :disabled="!canDragColumn(index)"
                         :title="t('structureEditor.dragColumn')"
                         :aria-label="t('structureEditor.dragColumn')"

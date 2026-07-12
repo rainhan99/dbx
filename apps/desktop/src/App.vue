@@ -73,6 +73,8 @@ import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { supportsSqlFileExecution } from "@/lib/database/databaseCapabilities";
 import { classifyAiSqlExecution } from "@/lib/ai/aiSqlExecutionPolicy";
 import { buildAppendedEditorSql } from "@/lib/ai/aiSqlAppend";
+import { assessProductionSql } from "@/lib/database/productionSafety";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/history/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/connection/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
@@ -814,7 +816,22 @@ async function saveActiveObjectSource(tab: QueryTab): Promise<boolean> {
       name: source.name,
       source: tab.sql,
     });
-    await executeObjectSourceSave(tab.connectionId, tab.database, databaseType, statements, source.schema || tab.schema);
+    const executableSql = statements.filter((sql) => sql.trim()).join(";\n");
+    if (executableSql.trim()) {
+      const saved = await executeWithProductionSqlGuard({
+        connection,
+        database: tab.database,
+        sql: executableSql,
+        source: t("production.sourceObjectSource"),
+        execute: async () => {
+          await executeObjectSourceSave(tab.connectionId, tab.database, databaseType, statements, source.schema || tab.schema);
+          return true;
+        },
+      });
+      if (!saved) return false;
+    } else {
+      await executeObjectSourceSave(tab.connectionId, tab.database, databaseType, statements, source.schema || tab.schema);
+    }
     queryStore.markTabClean(tab);
     toast(t("objects.sourceSaved"), 2000);
     return true;
@@ -1286,6 +1303,12 @@ function onAiRequestAutoExecuteSql(sql: string) {
   queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
   selectedSql.value = "";
 
+  const productionAssessment = assessProductionSql(sql, activeConnection.value, activeTab.value?.database);
+  if (productionAssessment.active && productionAssessment.isMutation) {
+    toast(t("production.aiReviewRequired"), 5000);
+    return;
+  }
+
   const decision = classifyAiSqlExecution(sql, activeConnection.value);
   if (decision.action === "block") {
     toast(t("ai.autoSqlBlocked"), 5000);
@@ -1393,6 +1416,12 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadTables(item.connectionId, item.database);
       }
     }
+    return;
+  } else if (item.type === "schema") {
+    const dbNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}`);
+    if (dbNode && !dbNode.isExpanded) await connectionStore.loadSchemas(item.connectionId, item.database);
+    const schemaNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}:${item.schema}`);
+    if (schemaNode && !schemaNode.isExpanded) await connectionStore.loadTables(item.connectionId, item.database, item.schema);
     return;
   } else if (item.type === "table" || item.type === "view" || item.type === "materialized_view") {
     // Open the table/view in a data tab
@@ -1912,7 +1941,7 @@ onUnmounted(() => {
                     @editor-selection-state-change="(tabId: string, selection: { anchor: number; head: number }) => queryStore.updateEditorSelection(tabId, selection)"
                     @format-error="toast(t('toolbar.formatSqlFailed'))"
                     @save-sql="void openSaveSqlDialog()"
-                    @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset)"
+                    @reload="(sql, searchText, whereInput, orderBy, limit, offset, intent) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset, intent)"
                     @paginate="onPaginate"
                     @sort="onSort"
                     @execute-sql="onExecuteSql"
